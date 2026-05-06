@@ -14,13 +14,6 @@ A Rust IRC protocol client used by the desktop application. Embedded directly in
 - Sliding-window rate limiter for outbound messages
 - CR/LF stripping on outbound lines to prevent IRC line injection
 
-## Tech Stack
-
-- [Rust](https://www.rust-lang.org/)
-- [tokio](https://tokio.rs/) — async runtime
-- [tokio-rustls](https://github.com/rustls/tokio-rustls) + [rustls](https://github.com/rustls/rustls) — TLS
-- [rustls-native-certs](https://github.com/rustls/rustls-native-certs) — system trust store
-
 ## Requirements
 
 - Rust >= 1.85 (stable)

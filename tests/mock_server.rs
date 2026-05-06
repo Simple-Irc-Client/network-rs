@@ -27,7 +27,9 @@ async fn wait_for(
     pred: impl Fn(&IrcEvent) -> bool,
     label: &str,
 ) -> IrcEvent {
-    let deadline = Duration::from_secs(5);
+    // CI runners are slow when shoveling MiBs across loopback under a
+    // current-thread runtime. 30 s is plenty for any non-buggy test path.
+    let deadline = Duration::from_secs(30);
     timeout(deadline, async {
         loop {
             let ev = rx.recv().await.expect("event channel closed");
