@@ -1,0 +1,21 @@
+[package]
+name = "sic-irc"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "IRC protocol client for Simple Irc Client"
+repository = "https://github.com/Simple-Irc-Client/network-rs"
+
+[lib]
+name = "sic_irc"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
