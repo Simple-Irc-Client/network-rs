@@ -25,6 +25,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::codec::{strip_crlf, LineBuffer, MAX_RECEIVE_BUFFER};
 use crate::error::IrcError;
+use crate::ratelimit::SlidingWindowLimiter;
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,8 +78,9 @@ pub enum IrcEvent {
     SocketConnected,
     /// Server sent RPL_WELCOME (numeric 001) — registration succeeded.
     Connected,
-    /// A raw IRC line was sent (`from_server: false`) or received (`true`).
-    Raw { line: String, from_server: bool },
+    /// A raw IRC line received from the server (`inbound: true`) or sent by
+    /// us as an outbound echo (`inbound: false`).
+    Raw { line: String, inbound: bool },
     /// CAP LS negotiation timed out after the configured retries.
     CapTimeout { retries: u32 },
     /// Connection closed.
@@ -224,6 +226,12 @@ async fn run(
     let mut pong_deadline: Option<Instant> = None;
     let mut buf = vec![0u8; 8192];
     let mut line_buffer = LineBuffer::new();
+    // Caller-originated sends only. Protocol traffic the driver generates
+    // itself (registration, PING/PONG, CAP) goes straight through
+    // `write_and_emit` and is intentionally exempt — matching the
+    // `./network` bridge, which rate-limits inbound WS messages but not the
+    // IRC client's own keepalive/registration.
+    let mut send_limiter = SlidingWindowLimiter::default_irc();
 
     loop {
         let cap_deadline = match cap_state {
@@ -267,6 +275,12 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ClientCommand::Send(line)) => {
+                        // Over the sliding window (50 msgs / 5 s): drop
+                        // silently, matching the `./network` bridge. Queuing
+                        // would risk unbounded memory under a flood.
+                        if !send_limiter.check_and_consume() {
+                            continue;
+                        }
                         if write_and_emit(&mut stream, &line, &event_tx).await.is_err() {
                             break;
                         }
@@ -356,7 +370,7 @@ async fn write_and_emit<S: AsyncWrite + Unpin>(
     let _ = event_tx
         .send(IrcEvent::Raw {
             line: line.to_string(),
-            from_server: false,
+            inbound: false,
         })
         .await;
     Ok(())
@@ -371,7 +385,7 @@ async fn handle_incoming_line<S: AsyncWrite + Unpin>(
     let _ = event_tx
         .send(IrcEvent::Raw {
             line: line.to_string(),
-            from_server: true,
+            inbound: true,
         })
         .await;
 

@@ -27,14 +27,24 @@ impl LineBuffer {
         self.inner.len()
     }
 
-    /// Pop the next complete line (without the `\r\n`) if one is buffered.
+    /// Pop the next complete line (without the terminator) if one is buffered.
     /// Empty lines are skipped.
+    ///
+    /// RFC 1459/2812 mandates `\r\n`, but some bouncers, proxies and test
+    /// servers emit a bare `\n`. Splitting strictly on `\r\n` would let such
+    /// a stream grow until it trips `MAX_RECEIVE_BUFFER` and the connection
+    /// is killed. So split on `\n` and strip an optional trailing `\r`,
+    /// accepting `\r\n`, `\n`, and even a stray lone `\r` inside a line.
     pub fn next_line(&mut self, encoding: Encoding) -> Option<String> {
         loop {
-            let idx = self.inner.windows(2).position(|w| w == b"\r\n")?;
-            let line_bytes: Vec<u8> = self.inner.drain(..idx).collect();
-            // Drop the CRLF
-            self.inner.drain(..2);
+            let idx = self.inner.iter().position(|&b| b == b'\n')?;
+            let mut line_bytes: Vec<u8> = self.inner.drain(..idx).collect();
+            // Drop the '\n'.
+            self.inner.drain(..1);
+            // Strip the '\r' of a '\r\n' terminator if present.
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
             if !line_bytes.is_empty() {
                 return Some(decode(encoding, &line_bytes));
             }
@@ -73,6 +83,25 @@ mod tests {
         let mut buf = LineBuffer::new();
         buf.extend(b"\r\n\r\nPING\r\n");
         assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("PING"));
+        assert_eq!(buf.next_line(Encoding::Utf8), None);
+    }
+
+    #[test]
+    fn splits_on_bare_lf() {
+        let mut buf = LineBuffer::new();
+        buf.extend(b"PING :foo\nPONG :bar\n");
+        assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("PING :foo"));
+        assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("PONG :bar"));
+        assert_eq!(buf.next_line(Encoding::Utf8), None);
+    }
+
+    #[test]
+    fn handles_mixed_crlf_and_lf() {
+        let mut buf = LineBuffer::new();
+        buf.extend(b"A :crlf\r\nB :lf\nC :crlf\r\n");
+        assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("A :crlf"));
+        assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("B :lf"));
+        assert_eq!(buf.next_line(Encoding::Utf8).as_deref(), Some("C :crlf"));
         assert_eq!(buf.next_line(Encoding::Utf8), None);
     }
 

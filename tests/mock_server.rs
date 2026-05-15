@@ -159,7 +159,7 @@ async fn auto_replies_to_ping() {
     .await;
     wait_for(
         &mut events,
-        |e| matches!(e, IrcEvent::Raw { line, from_server: false } if line == "PONG :payload-42"),
+        |e| matches!(e, IrcEvent::Raw { line, inbound: false } if line == "PONG :payload-42"),
         "PONG raw",
     )
     .await;
@@ -212,6 +212,53 @@ async fn buffer_overflow_drops_connection() {
         "BufferOverflow error",
     )
     .await;
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn outbound_rate_limiter_drops_excess() {
+    let (port, listener) = bind_local().await;
+
+    let (count_tx, count_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, _wr) = sock.into_split();
+        let mut reader = BufReader::new(rd);
+        let mut count = 0usize;
+        // Count lines until the client goes idle (the dropped sends never
+        // arrive, so the read stalls and the idle timeout ends the loop).
+        loop {
+            let mut buf = String::new();
+            match timeout(Duration::from_millis(500), reader.read_line(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => count += 1,
+            }
+        }
+        let _ = count_tx.send(count);
+    });
+
+    // Raw mode (no registration) so the only lines the server sees are the
+    // caller's sends — registration/PING/CAP are not rate-limited.
+    let opts = IrcClientOptions::new("127.0.0.1", port);
+    let (client, mut events) = IrcClient::connect(opts);
+    wait_for(
+        &mut events,
+        |e| matches!(e, IrcEvent::SocketConnected),
+        "SocketConnected",
+    )
+    .await;
+
+    // 60 sends, well inside one 5 s window: 50 pass, 10 are dropped.
+    for i in 0..60 {
+        client.send(format!("PRIVMSG #c :{i}")).await.unwrap();
+    }
+
+    let count = count_rx.await.unwrap();
+    assert_eq!(
+        count, 50,
+        "sliding-window limiter must pass exactly 50 of 60 within the window"
+    );
 
     server.await.unwrap();
 }
