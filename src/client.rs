@@ -63,9 +63,9 @@ impl IrcClientOptions {
 pub enum IrcEvent {
     /// TCP/TLS handshake completed.
     SocketConnected,
-    /// A raw IRC line received from the server (`inbound: true`) or sent by
-    /// us as an outbound echo (`inbound: false`).
-    Raw { line: String, inbound: bool },
+    /// A raw IRC line received from the server. (Outbound lines the caller
+    /// sends are not echoed — the caller already has them.)
+    Raw { line: String },
     /// Connection closed.
     Closed,
     /// A non-fatal or fatal error. A fatal error is followed by `Closed`.
@@ -178,9 +178,7 @@ async fn run(
                             break;
                         }
                         while let Some(line) = line_buffer.next_line(opts.encoding) {
-                            let _ = event_tx
-                                .send(IrcEvent::Raw { line, inbound: true })
-                                .await;
+                            let _ = event_tx.send(IrcEvent::Raw { line }).await;
                         }
                     }
                     Err(e) => {
@@ -200,7 +198,7 @@ async fn run(
                         if !send_limiter.check_and_consume() {
                             continue;
                         }
-                        if write_and_emit(&mut stream, &line, &event_tx).await.is_err() {
+                        if write_line(&mut stream, &line).await.is_err() {
                             break;
                         }
                     }
@@ -209,7 +207,7 @@ async fn run(
                             Some(m) => format!("QUIT :{}", strip_crlf(&m)),
                             None => "QUIT".to_string(),
                         };
-                        let _ = write_and_emit(&mut stream, &q, &event_tx).await;
+                        let _ = write_line(&mut stream, &q).await;
                         let _ = stream.shutdown().await;
                         break;
                     }
@@ -226,23 +224,17 @@ async fn close(event_tx: &mpsc::Sender<IrcEvent>) {
     let _ = event_tx.send(IrcEvent::Closed).await;
 }
 
-async fn write_and_emit<S: AsyncWrite + Unpin>(
+/// Write one IRC line (CRLF-terminated, injection-stripped) to the socket.
+/// Outbound lines are not echoed back as events — the caller already has them.
+async fn write_line<S: AsyncWrite + Unpin>(
     stream: &mut S,
     line: &str,
-    event_tx: &mpsc::Sender<IrcEvent>,
 ) -> Result<(), std::io::Error> {
     let stripped = strip_crlf(line);
     let mut bytes = stripped.into_bytes();
     bytes.extend_from_slice(b"\r\n");
     stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    let _ = event_tx
-        .send(IrcEvent::Raw {
-            line: line.to_string(),
-            inbound: false,
-        })
-        .await;
-    Ok(())
+    stream.flush().await
 }
 
 async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, IrcError> {

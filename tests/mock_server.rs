@@ -104,7 +104,7 @@ async fn pipe_surfaces_inbound_lines_and_never_auto_replies() {
 
     wait_for(
         &mut events,
-        |e| matches!(e, IrcEvent::Raw { line, inbound: true } if line == "PING :payload-42"),
+        |e| matches!(e, IrcEvent::Raw { line } if line == "PING :payload-42"),
         "inbound PING raw",
     )
     .await;
