@@ -5,9 +5,6 @@ pub enum IrcError {
     #[error("connection timed out")]
     ConnectTimeout,
 
-    #[error("PONG timeout: server unresponsive")]
-    PongTimeout,
-
     #[error("receive buffer overflow: server sent too much data without line terminators")]
     BufferOverflow,
 

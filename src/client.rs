@@ -1,12 +1,16 @@
-//! Async IRC client.
+//! Async IRC byte-pipe transport.
 //!
 //! The driver runs as a single tokio task that owns the socket and a `select!`
 //! loop over:
-//!   - socket reads (line buffered)
+//!   - socket reads (line buffered) -> emitted as inbound `Raw` events
 //!   - inbound commands from the caller (send / quit / disconnect)
-//!   - the PING keepalive interval
-//!   - the PONG response deadline (active only while waiting for one)
-//!   - the CAP LS response deadline (active only during capability negotiation)
+//!
+//! This is a **pure transport**: it does NOT speak any IRC protocol — no
+//! registration, no CAP negotiation, not even PING/PONG. The caller (the app's
+//! kernel) owns the entire IRC conversation, including replying to server PINGs
+//! and connection-liveness/keepalive policy. The driver only establishes the
+//! TCP/TLS socket, surfaces every received line, writes the lines the caller
+//! sends (rate-limited), and reports closure/errors.
 //!
 //! Events flow out over an `mpsc::Receiver<IrcEvent>` so the consumer can
 //! forward them however it likes.
@@ -17,7 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{self, Instant};
+use tokio::time;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -27,11 +31,7 @@ use crate::codec::{strip_crlf, LineBuffer, MAX_RECEIVE_BUFFER};
 use crate::error::IrcError;
 use crate::ratelimit::SlidingWindowLimiter;
 
-const PING_INTERVAL: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(120);
-const CAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const CAP_MAX_RETRIES: u32 = 2;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Encoding {
@@ -41,36 +41,11 @@ pub enum Encoding {
 }
 
 #[derive(Clone, Debug)]
-pub struct RegistrationOptions {
-    pub nick: String,
-    pub username: String,
-    pub gecos: String,
-    /// Who drives IRCv3 capability negotiation.
-    ///
-    /// `true` (standalone client): after `CAP LS 302` the driver waits for the
-    /// server's listing and sends `CAP END` itself, retrying the LS up to
-    /// [`CAP_MAX_RETRIES`] times.
-    ///
-    /// `false` (transport behind another negotiator): the driver still opens
-    /// negotiation with `CAP LS 302` and sends `NICK`/`USER` — mirroring the
-    /// WebSocket transport's `onopen` — but then stays out of CAP entirely: no
-    /// waiting, no retries, no `CAP END`. A higher layer (e.g. the desktop
-    /// kernel running CAP REQ / SASL / CAP END) owns the rest. Exactly one side
-    /// must manage CAP; two competing flows on one socket desync the server's
-    /// registration and trip "Registration Timeout".
-    pub negotiate_caps: bool,
-}
-
-#[derive(Clone, Debug)]
 pub struct IrcClientOptions {
     pub host: String,
     pub port: u16,
     pub tls: bool,
     pub encoding: Encoding,
-    pub pong_timeout: Duration,
-    /// `Some` -> "full" mode: client sends `CAP LS 302`, `NICK`, `USER` after
-    /// the socket is up. `None` -> "raw" mode: caller drives registration.
-    pub registration: Option<RegistrationOptions>,
 }
 
 impl IrcClientOptions {
@@ -80,8 +55,6 @@ impl IrcClientOptions {
             port,
             tls: false,
             encoding: Encoding::Utf8,
-            pong_timeout: DEFAULT_PONG_TIMEOUT,
-            registration: None,
         }
     }
 }
@@ -90,13 +63,9 @@ impl IrcClientOptions {
 pub enum IrcEvent {
     /// TCP/TLS handshake completed.
     SocketConnected,
-    /// Server sent RPL_WELCOME (numeric 001) — registration succeeded.
-    Connected,
     /// A raw IRC line received from the server (`inbound: true`) or sent by
     /// us as an outbound echo (`inbound: false`).
     Raw { line: String, inbound: bool },
-    /// CAP LS negotiation timed out after the configured retries.
-    CapTimeout { retries: u32 },
     /// Connection closed.
     Closed,
     /// A non-fatal or fatal error. A fatal error is followed by `Closed`.
@@ -172,14 +141,6 @@ impl IrcClient {
 trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> IoStream for T {}
 
-#[derive(Debug)]
-enum CapState {
-    /// CAP LS not in flight (raw mode, or already finished).
-    Done,
-    /// Awaiting the server's CAP LS response.
-    Waiting { retries: u32, deadline: Instant },
-}
-
 async fn run(
     opts: IrcClientOptions,
     mut cmd_rx: mpsc::Receiver<ClientCommand>,
@@ -196,77 +157,20 @@ async fn run(
 
     let _ = event_tx.send(IrcEvent::SocketConnected).await;
 
-    let mut cap_state = CapState::Done;
-    if let Some(reg) = &opts.registration {
-        // Order: CAP LS 302, NICK, USER. When we own CAP negotiation, the LS
-        // timer starts the moment we send CAP LS; when a higher layer owns it
-        // (`negotiate_caps == false`) we open negotiation but never wait or
-        // send CAP END, leaving `cap_state` at `Done`.
-        if write_and_emit(&mut stream, "CAP LS 302", &event_tx)
-            .await
-            .is_err()
-        {
-            close(&event_tx).await;
-            return;
-        }
-        if reg.negotiate_caps {
-            cap_state = CapState::Waiting {
-                retries: 0,
-                deadline: Instant::now() + CAP_RESPONSE_TIMEOUT,
-            };
-        }
-        let nick_line = format!("NICK {}", strip_crlf(&reg.nick));
-        if write_and_emit(&mut stream, &nick_line, &event_tx)
-            .await
-            .is_err()
-        {
-            close(&event_tx).await;
-            return;
-        }
-        let user_line = format!(
-            "USER {} 0 * :{}",
-            strip_crlf(&reg.username),
-            strip_crlf(&reg.gecos),
-        );
-        if write_and_emit(&mut stream, &user_line, &event_tx)
-            .await
-            .is_err()
-        {
-            close(&event_tx).await;
-            return;
-        }
-    }
-
-    let mut ping_interval = time::interval(PING_INTERVAL);
-    // The first tick of `interval()` fires immediately — skip it so we don't
-    // PING right after the socket comes up.
-    ping_interval.tick().await;
-
-    let mut pong_deadline: Option<Instant> = None;
     let mut buf = vec![0u8; 8192];
     let mut line_buffer = LineBuffer::new();
-    // Caller-originated sends only. Protocol traffic the driver generates
-    // itself (registration, PING/PONG, CAP) goes straight through
-    // `write_and_emit` and is intentionally exempt — matching the
-    // `./network` bridge, which rate-limits inbound WS messages but not the
-    // IRC client's own keepalive/registration.
+    // Caller-originated sends only. Matches the `./network` bridge, which
+    // rate-limits inbound WS messages.
     let mut send_limiter = SlidingWindowLimiter::default_irc();
 
     loop {
-        let cap_deadline = match cap_state {
-            CapState::Waiting { deadline, .. } => Some(deadline),
-            CapState::Done => None,
-        };
-
         tokio::select! {
-            // Socket read.
+            // Socket read -> surface each line as an inbound Raw event.
             res = stream.read(&mut buf) => {
                 match res {
                     Ok(0) => break,
                     Ok(n) => {
                         line_buffer.extend(&buf[..n]);
-                        // Any data from the server proves it's alive; clear PONG deadline.
-                        pong_deadline = None;
                         if line_buffer.len() > MAX_RECEIVE_BUFFER {
                             let _ = event_tx
                                 .send(IrcEvent::Error(IrcError::BufferOverflow.to_string()))
@@ -274,13 +178,9 @@ async fn run(
                             break;
                         }
                         while let Some(line) = line_buffer.next_line(opts.encoding) {
-                            handle_incoming_line(
-                                &line,
-                                &event_tx,
-                                &mut stream,
-                                &mut cap_state,
-                            )
-                            .await;
+                            let _ = event_tx
+                                .send(IrcEvent::Raw { line, inbound: true })
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -316,48 +216,6 @@ async fn run(
                     Some(ClientCommand::Disconnect) | None => break,
                 }
             }
-
-            // PING keepalive.
-            _ = ping_interval.tick() => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let line = format!("PING :{}", now_ms);
-                if write_and_emit(&mut stream, &line, &event_tx).await.is_err() {
-                    break;
-                }
-                pong_deadline = Some(Instant::now() + opts.pong_timeout);
-            }
-
-            // PONG deadline.
-            _ = sleep_until_opt(pong_deadline) => {
-                let _ = event_tx
-                    .send(IrcEvent::Error(IrcError::PongTimeout.to_string()))
-                    .await;
-                break;
-            }
-
-            // CAP LS response deadline.
-            _ = sleep_until_opt(cap_deadline) => {
-                if let CapState::Waiting { retries, .. } = cap_state {
-                    if retries < CAP_MAX_RETRIES {
-                        let next = retries + 1;
-                        if write_and_emit(&mut stream, "CAP LS 302", &event_tx).await.is_err() {
-                            break;
-                        }
-                        cap_state = CapState::Waiting {
-                            retries: next,
-                            deadline: Instant::now() + CAP_RESPONSE_TIMEOUT,
-                        };
-                    } else {
-                        let _ = event_tx
-                            .send(IrcEvent::CapTimeout { retries })
-                            .await;
-                        cap_state = CapState::Done;
-                    }
-                }
-            }
         }
     }
 
@@ -366,14 +224,6 @@ async fn run(
 
 async fn close(event_tx: &mpsc::Sender<IrcEvent>) {
     let _ = event_tx.send(IrcEvent::Closed).await;
-}
-
-/// Sleep until `at`, or never if `at` is None.
-async fn sleep_until_opt(at: Option<Instant>) {
-    match at {
-        Some(t) => time::sleep_until(t).await,
-        None => std::future::pending::<()>().await,
-    }
 }
 
 async fn write_and_emit<S: AsyncWrite + Unpin>(
@@ -393,96 +243,6 @@ async fn write_and_emit<S: AsyncWrite + Unpin>(
         })
         .await;
     Ok(())
-}
-
-async fn handle_incoming_line<S: AsyncWrite + Unpin>(
-    line: &str,
-    event_tx: &mpsc::Sender<IrcEvent>,
-    stream: &mut S,
-    cap_state: &mut CapState,
-) {
-    let _ = event_tx
-        .send(IrcEvent::Raw {
-            line: line.to_string(),
-            inbound: true,
-        })
-        .await;
-
-    // Auto-reply to PING.
-    if let Some(rest) = line.strip_prefix("PING ") {
-        let pong = format!("PONG {}", rest);
-        let _ = write_and_emit(stream, &pong, event_tx).await;
-        return;
-    }
-
-    // CAP LS handling — both prefixed (":server CAP nick LS …") and bare
-    // ("CAP * LS …") forms.
-    if let Some(is_continuation) = parse_cap_ls(line) {
-        let was_waiting = matches!(cap_state, CapState::Waiting { .. });
-        if was_waiting && !is_continuation {
-            let _ = write_and_emit(stream, "CAP END", event_tx).await;
-            *cap_state = CapState::Done;
-        } else if was_waiting {
-            // Continuation: extend the deadline so retries don't fire while
-            // the server is mid-stream.
-            if let CapState::Waiting { retries, .. } = cap_state {
-                *cap_state = CapState::Waiting {
-                    retries: *retries,
-                    deadline: Instant::now() + CAP_RESPONSE_TIMEOUT,
-                };
-            }
-        }
-        return;
-    }
-
-    // RPL_WELCOME → registered.
-    if is_rpl_welcome(line) {
-        let _ = event_tx.send(IrcEvent::Connected).await;
-    }
-}
-
-/// Returns `Some(is_continuation)` if `line` looks like `CAP <client> LS [*] …`.
-fn parse_cap_ls(line: &str) -> Option<bool> {
-    let mut tokens = line.split_whitespace();
-    while let Some(tok) = tokens.next() {
-        if tok == "CAP" {
-            // Next token is the client name (or *).
-            tokens.next()?;
-            if tokens.next() == Some("LS") {
-                let is_continuation = tokens.next() == Some("*");
-                return Some(is_continuation);
-            }
-            return None;
-        }
-    }
-    None
-}
-
-/// Returns true for an RPL_WELCOME numeric.
-/// Matches `(@tags )?:source 001 ` where source has no `!` or `@`.
-fn is_rpl_welcome(line: &str) -> bool {
-    let after_tags = if let Some(rest) = line.strip_prefix('@') {
-        match rest.find(' ') {
-            Some(i) => &rest[i + 1..],
-            None => return false,
-        }
-    } else {
-        line
-    };
-    let body = match after_tags.strip_prefix(':') {
-        Some(s) => s,
-        None => return false,
-    };
-    let space = match body.find(' ') {
-        Some(i) => i,
-        None => return false,
-    };
-    let source = &body[..space];
-    if source.contains('!') || source.contains('@') {
-        return false;
-    }
-    let after_source = &body[space + 1..];
-    after_source.starts_with("001 ") || after_source == "001"
 }
 
 async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, IrcError> {
@@ -517,58 +277,4 @@ async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, Ir
         .map_err(|e| IrcError::Tls(e.to_string()))?;
 
     Ok(Box::new(tls))
-}
-
-#[cfg(test)]
-mod parser_tests {
-    use super::*;
-
-    #[test]
-    fn rpl_welcome_basic() {
-        assert!(is_rpl_welcome(":irc.example.com 001 nick :Welcome"));
-    }
-
-    #[test]
-    fn rpl_welcome_with_tags() {
-        assert!(is_rpl_welcome(
-            "@time=2024-01-01T00:00:00Z :irc.example.com 001 nick :Welcome"
-        ));
-    }
-
-    #[test]
-    fn rpl_welcome_rejects_user_hostmask_source() {
-        assert!(!is_rpl_welcome(":nick!user@host 001 nick :hi"));
-    }
-
-    #[test]
-    fn rpl_welcome_rejects_other_numerics() {
-        assert!(!is_rpl_welcome(":irc.example.com 002 nick :foo"));
-    }
-
-    #[test]
-    fn cap_ls_no_prefix_final() {
-        assert_eq!(parse_cap_ls("CAP * LS :sasl multi-prefix"), Some(false));
-    }
-
-    #[test]
-    fn cap_ls_no_prefix_continuation() {
-        assert_eq!(parse_cap_ls("CAP * LS * :sasl"), Some(true));
-    }
-
-    #[test]
-    fn cap_ls_with_prefix() {
-        assert_eq!(
-            parse_cap_ls(":irc.example.com CAP nick LS :sasl"),
-            Some(false)
-        );
-        assert_eq!(
-            parse_cap_ls(":irc.example.com CAP nick LS * :sasl"),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn cap_ack_is_not_cap_ls() {
-        assert_eq!(parse_cap_ls("CAP * ACK :multi-prefix"), None);
-    }
 }

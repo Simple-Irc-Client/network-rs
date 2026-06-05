@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use sic_irc::{IrcClient, IrcClientOptions, IrcEvent, RegistrationOptions};
+use sic_irc::{IrcClient, IrcClientOptions, IrcEvent};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -63,8 +63,7 @@ async fn raw_mode_connects_and_emits_socket_connected() {
         drop(sock);
     });
 
-    let mut opts = IrcClientOptions::new("127.0.0.1", port);
-    opts.pong_timeout = Duration::from_secs(1);
+    let opts = IrcClientOptions::new("127.0.0.1", port);
     let (_client, mut events) = IrcClient::connect(opts);
 
     let ev = wait_for(
@@ -79,124 +78,9 @@ async fn raw_mode_connects_and_emits_socket_connected() {
 }
 
 #[tokio::test]
-async fn full_mode_sends_cap_nick_user_and_handles_welcome() {
-    let (port, listener) = bind_local().await;
-
-    let server = tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        let (rd, mut wr) = sock.into_split();
-        let mut reader = BufReader::new(rd);
-
-        let cap = read_line(&mut reader).await;
-        assert_eq!(cap, "CAP LS 302");
-        let nick = read_line(&mut reader).await;
-        assert_eq!(nick, "NICK testnick");
-        let user = read_line(&mut reader).await;
-        assert_eq!(user, "USER testuser 0 * :Test User");
-
-        // Respond with CAP LS final, expect CAP END, then send 001.
-        wr.write_all(b":mock CAP * LS :sasl multi-prefix\r\n")
-            .await
-            .unwrap();
-        let cap_end = read_line(&mut reader).await;
-        assert_eq!(cap_end, "CAP END");
-
-        wr.write_all(b":mock 001 testnick :Welcome\r\n")
-            .await
-            .unwrap();
-        // Keep the socket open a moment so the client surface the events.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    });
-
-    let mut opts = IrcClientOptions::new("127.0.0.1", port);
-    opts.registration = Some(RegistrationOptions {
-        nick: "testnick".into(),
-        username: "testuser".into(),
-        gecos: "Test User".into(),
-        negotiate_caps: true,
-    });
-    opts.pong_timeout = Duration::from_secs(5);
-
-    let (_client, mut events) = IrcClient::connect(opts);
-
-    wait_for(
-        &mut events,
-        |e| matches!(e, IrcEvent::SocketConnected),
-        "SocketConnected",
-    )
-    .await;
-    wait_for(
-        &mut events,
-        |e| matches!(e, IrcEvent::Connected),
-        "Connected",
-    )
-    .await;
-
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn transport_mode_opens_cap_but_never_sends_cap_end() {
-    // With `negotiate_caps: false` the driver must open negotiation (CAP LS /
-    // NICK / USER) so a higher layer can take over, but must NOT manage CAP
-    // itself: no CAP END in response to the server's listing, no LS retries.
-    let (port, listener) = bind_local().await;
-
-    let server = tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        let (rd, mut wr) = sock.into_split();
-        let mut reader = BufReader::new(rd);
-
-        assert_eq!(read_line(&mut reader).await, "CAP LS 302");
-        assert_eq!(read_line(&mut reader).await, "NICK testnick");
-        assert_eq!(read_line(&mut reader).await, "USER testuser 0 * :Test User");
-
-        // Send the final CAP LS listing. A standalone client would now fire
-        // CAP END; this driver must stay silent.
-        wr.write_all(b":mock CAP * LS :sasl multi-prefix\r\n")
-            .await
-            .unwrap();
-
-        // Nothing more should arrive on its own. (CAP_RESPONSE_TIMEOUT is 10s,
-        // so 2s with no auto CAP END / no retry is a sound assertion.)
-        let mut buf = String::new();
-        let idle = timeout(Duration::from_secs(2), reader.read_line(&mut buf)).await;
-        assert!(
-            idle.is_err(),
-            "driver must not send anything (got {buf:?}) when negotiate_caps is false"
-        );
-
-        // The higher layer would eventually CAP END; emulate the server then
-        // completing registration so we can prove the read loop is still live.
-        wr.write_all(b":mock 001 testnick :Welcome\r\n")
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    });
-
-    let mut opts = IrcClientOptions::new("127.0.0.1", port);
-    opts.registration = Some(RegistrationOptions {
-        nick: "testnick".into(),
-        username: "testuser".into(),
-        gecos: "Test User".into(),
-        negotiate_caps: false,
-    });
-    opts.pong_timeout = Duration::from_secs(5);
-
-    let (_client, mut events) = IrcClient::connect(opts);
-
-    wait_for(
-        &mut events,
-        |e| matches!(e, IrcEvent::Connected),
-        "Connected",
-    )
-    .await;
-
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn auto_replies_to_ping() {
+async fn pipe_surfaces_inbound_lines_and_never_auto_replies() {
+    // The transport speaks no IRC protocol: even a server PING is just surfaced
+    // as an inbound Raw line — the caller owns PING/PONG and all registration.
     let (port, listener) = bind_local().await;
 
     let server = tokio::spawn(async move {
@@ -205,8 +89,14 @@ async fn auto_replies_to_ping() {
         let mut reader = BufReader::new(rd);
 
         wr.write_all(b"PING :payload-42\r\n").await.unwrap();
-        let pong = read_line(&mut reader).await;
-        assert_eq!(pong, "PONG :payload-42");
+
+        // Nothing must come back on its own (no auto-PONG, no registration).
+        let mut buf = String::new();
+        let idle = timeout(Duration::from_secs(1), reader.read_line(&mut buf)).await;
+        assert!(
+            idle.is_err(),
+            "pure pipe must not write anything unprompted (got {buf:?})"
+        );
     });
 
     let opts = IrcClientOptions::new("127.0.0.1", port);
@@ -214,14 +104,8 @@ async fn auto_replies_to_ping() {
 
     wait_for(
         &mut events,
-        |e| matches!(e, IrcEvent::SocketConnected),
-        "SocketConnected",
-    )
-    .await;
-    wait_for(
-        &mut events,
-        |e| matches!(e, IrcEvent::Raw { line, inbound: false } if line == "PONG :payload-42"),
-        "PONG raw",
+        |e| matches!(e, IrcEvent::Raw { line, inbound: true } if line == "PING :payload-42"),
+        "inbound PING raw",
     )
     .await;
 
