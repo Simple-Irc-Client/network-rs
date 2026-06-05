@@ -45,6 +45,20 @@ pub struct RegistrationOptions {
     pub nick: String,
     pub username: String,
     pub gecos: String,
+    /// Who drives IRCv3 capability negotiation.
+    ///
+    /// `true` (standalone client): after `CAP LS 302` the driver waits for the
+    /// server's listing and sends `CAP END` itself, retrying the LS up to
+    /// [`CAP_MAX_RETRIES`] times.
+    ///
+    /// `false` (transport behind another negotiator): the driver still opens
+    /// negotiation with `CAP LS 302` and sends `NICK`/`USER` — mirroring the
+    /// WebSocket transport's `onopen` — but then stays out of CAP entirely: no
+    /// waiting, no retries, no `CAP END`. A higher layer (e.g. the desktop
+    /// kernel running CAP REQ / SASL / CAP END) owns the rest. Exactly one side
+    /// must manage CAP; two competing flows on one socket desync the server's
+    /// registration and trip "Registration Timeout".
+    pub negotiate_caps: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +198,10 @@ async fn run(
 
     let mut cap_state = CapState::Done;
     if let Some(reg) = &opts.registration {
-        // Order: CAP LS 302, NICK, USER. CAP timer starts the moment we send CAP LS.
+        // Order: CAP LS 302, NICK, USER. When we own CAP negotiation, the LS
+        // timer starts the moment we send CAP LS; when a higher layer owns it
+        // (`negotiate_caps == false`) we open negotiation but never wait or
+        // send CAP END, leaving `cap_state` at `Done`.
         if write_and_emit(&mut stream, "CAP LS 302", &event_tx)
             .await
             .is_err()
@@ -192,10 +209,12 @@ async fn run(
             close(&event_tx).await;
             return;
         }
-        cap_state = CapState::Waiting {
-            retries: 0,
-            deadline: Instant::now() + CAP_RESPONSE_TIMEOUT,
-        };
+        if reg.negotiate_caps {
+            cap_state = CapState::Waiting {
+                retries: 0,
+                deadline: Instant::now() + CAP_RESPONSE_TIMEOUT,
+            };
+        }
         let nick_line = format!("NICK {}", strip_crlf(&reg.nick));
         if write_and_emit(&mut stream, &nick_line, &event_tx)
             .await

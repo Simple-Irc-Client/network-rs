@@ -113,6 +113,7 @@ async fn full_mode_sends_cap_nick_user_and_handles_welcome() {
         nick: "testnick".into(),
         username: "testuser".into(),
         gecos: "Test User".into(),
+        negotiate_caps: true,
     });
     opts.pong_timeout = Duration::from_secs(5);
 
@@ -124,6 +125,66 @@ async fn full_mode_sends_cap_nick_user_and_handles_welcome() {
         "SocketConnected",
     )
     .await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, IrcEvent::Connected),
+        "Connected",
+    )
+    .await;
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn transport_mode_opens_cap_but_never_sends_cap_end() {
+    // With `negotiate_caps: false` the driver must open negotiation (CAP LS /
+    // NICK / USER) so a higher layer can take over, but must NOT manage CAP
+    // itself: no CAP END in response to the server's listing, no LS retries.
+    let (port, listener) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = BufReader::new(rd);
+
+        assert_eq!(read_line(&mut reader).await, "CAP LS 302");
+        assert_eq!(read_line(&mut reader).await, "NICK testnick");
+        assert_eq!(read_line(&mut reader).await, "USER testuser 0 * :Test User");
+
+        // Send the final CAP LS listing. A standalone client would now fire
+        // CAP END; this driver must stay silent.
+        wr.write_all(b":mock CAP * LS :sasl multi-prefix\r\n")
+            .await
+            .unwrap();
+
+        // Nothing more should arrive on its own. (CAP_RESPONSE_TIMEOUT is 10s,
+        // so 2s with no auto CAP END / no retry is a sound assertion.)
+        let mut buf = String::new();
+        let idle = timeout(Duration::from_secs(2), reader.read_line(&mut buf)).await;
+        assert!(
+            idle.is_err(),
+            "driver must not send anything (got {buf:?}) when negotiate_caps is false"
+        );
+
+        // The higher layer would eventually CAP END; emulate the server then
+        // completing registration so we can prove the read loop is still live.
+        wr.write_all(b":mock 001 testnick :Welcome\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let mut opts = IrcClientOptions::new("127.0.0.1", port);
+    opts.registration = Some(RegistrationOptions {
+        nick: "testnick".into(),
+        username: "testuser".into(),
+        gecos: "Test User".into(),
+        negotiate_caps: false,
+    });
+    opts.pong_timeout = Duration::from_secs(5);
+
+    let (_client, mut events) = IrcClient::connect(opts);
+
     wait_for(
         &mut events,
         |e| matches!(e, IrcEvent::Connected),
