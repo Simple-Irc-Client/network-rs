@@ -2,14 +2,12 @@
 
 [![CI](https://github.com/Simple-Irc-Client/network-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Simple-Irc-Client/network-rs/actions/workflows/ci.yml)
 
-A Rust IRC protocol client used by the desktop application. Embedded directly into the Tauri shell — there is no localhost WebSocket bridge.
+A Rust **byte-pipe transport** for IRC servers. Embedded directly into the Tauri shell — there is no localhost WebSocket bridge.
 
 ## Features
 
 - Async TCP and TLS connections to IRC servers
-- PING/PONG keepalive with configurable PONG timeout
-- CAP LS 302 negotiation with retries
-- Full mode (auto NICK/USER registration) and raw mode
+- Pure transport: **does NOT speak IRC protocol** — no registration, CAP, or PING/PONG
 - Receive-buffer cap to defend against unterminated server lines
 - Sliding-window rate limiter for outbound messages
 - CR/LF stripping on outbound lines to prevent IRC line injection
