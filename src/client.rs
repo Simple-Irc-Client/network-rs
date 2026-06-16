@@ -237,6 +237,32 @@ async fn write_line<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
+/// Build the TLS trust anchors for the current platform.
+///
+/// Desktop/server targets read the OS trust store (`rustls-native-certs`).
+/// Android has no file-based store that crate can read, so we bundle Mozilla's
+/// WebPKI roots — adequate for the publicly-trusted certificates IRC networks
+/// present. (A future enhancement could bridge to the Android Java KeyStore via
+/// `rustls-platform-verifier` to honor user/enterprise-added CAs.)
+fn load_root_store() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            let _ = roots.add(cert);
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    roots
+}
+
 async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, IrcError> {
     let addr = format!("{}:{}", opts.host, opts.port);
     let tcp = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
@@ -246,11 +272,7 @@ async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, Ir
         return Ok(Box::new(tcp));
     }
 
-    let mut roots = RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = roots.add(cert);
-    }
+    let roots = load_root_store();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
