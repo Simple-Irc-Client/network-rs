@@ -24,7 +24,11 @@ impl DccListener {
             return Self::from_std(inner);
         }
 
-        let (low, high) = if start <= end { (start, end) } else { (end, start) };
+        let (low, high) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         for port in low..=high {
             if let Ok(inner) = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
                 return Self::from_std(inner);
@@ -86,11 +90,17 @@ impl DccListener {
 /// reports `::ffff:1.2.3.4` for a peer that offered `1.2.3.4`.
 fn same_host(expected: IpAddr, actual: SocketAddr) -> bool {
     let actual = match actual.ip() {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         ip => ip,
     };
     let expected = match expected {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         ip => ip,
     };
     expected == actual
@@ -136,9 +146,7 @@ mod tests {
     #[tokio::test]
     async fn accept_times_out_when_nobody_connects() {
         let listener = DccListener::bind(0, 0).unwrap();
-        let result = listener
-            .accept_from(None, Duration::from_millis(50))
-            .await;
+        let result = listener.accept_from(None, Duration::from_millis(50)).await;
         assert!(matches!(result, Err(DccError::Timeout)));
     }
 }

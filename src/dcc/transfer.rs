@@ -18,8 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time;
 
-use super::{DccError, DccEvent};
 use super::stream::DccStream;
+use super::{DccError, DccEvent};
 
 const CHUNK: usize = 64 * 1024;
 

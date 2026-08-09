@@ -66,16 +66,26 @@ pub enum DccError {
 #[derive(Clone, Debug)]
 pub enum DccEvent {
     /// A port was bound and is in the CTCP offer the caller is about to send.
-    Listening { port: u16 },
+    Listening {
+        port: u16,
+    },
     /// The peer socket is up. `tls_fingerprint` is present only on the dialling
     /// side of a secure session (see `stream.rs`).
-    Connected { tls_fingerprint: Option<String> },
+    Connected {
+        tls_fingerprint: Option<String>,
+    },
     /// One line of DCC CHAT text from the peer.
-    Line { text: String },
+    Line {
+        text: String,
+    },
     /// Bytes moved so far, for a file transfer.
-    Progress { transferred: u64 },
+    Progress {
+        transferred: u64,
+    },
     /// The transfer finished and, when receiving, the file is on disk at `path`.
-    Completed { path: Option<String> },
+    Completed {
+        path: Option<String>,
+    },
     /// The session ended. Always the last event.
     Closed,
     Error(String),
@@ -186,11 +196,7 @@ async fn finish(result: Result<Option<String>, DccError>, events: &mpsc::Sender<
 }
 
 /// Wrap an accepted/dialled socket in TLS when the session is a secure variant.
-async fn wrap(
-    tcp: TcpStream,
-    secure: bool,
-    incoming: bool,
-) -> Result<stream::DccStream, DccError> {
+async fn wrap(tcp: TcpStream, secure: bool, incoming: bool) -> Result<stream::DccStream, DccError> {
     if !secure {
         return Ok(stream::plain(tcp));
     }

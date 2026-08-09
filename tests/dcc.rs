@@ -90,10 +90,20 @@ async fn chat_receives_lines_from_the_peer() {
 
     let (_session, mut events) = DccSession::connect(connect_options(port));
 
-    let first = wait_for(&mut events, |e| matches!(e, DccEvent::Line { .. }), "first line").await;
+    let first = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Line { .. }),
+        "first line",
+    )
+    .await;
     assert!(matches!(first, DccEvent::Line { text } if text == "hello"));
 
-    let second = wait_for(&mut events, |e| matches!(e, DccEvent::Line { .. }), "second line").await;
+    let second = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Line { .. }),
+        "second line",
+    )
+    .await;
     // A bare \n and a \r\n must both frame, since real clients send either.
     assert!(matches!(second, DccEvent::Line { text } if text == "world"));
 }
@@ -110,7 +120,12 @@ async fn chat_sends_newline_terminated_lines() {
     });
 
     let (session, mut events) = DccSession::connect(connect_options(port));
-    wait_for(&mut events, |e| matches!(e, DccEvent::Connected { .. }), "connect").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Connected { .. }),
+        "connect",
+    )
+    .await;
     session.send_line("hi there").await.unwrap();
 
     assert_eq!(peer.await.unwrap(), "hi there\n");
@@ -128,7 +143,12 @@ async fn chat_strips_embedded_newlines_from_outgoing_text() {
     });
 
     let (session, mut events) = DccSession::connect(connect_options(port));
-    wait_for(&mut events, |e| matches!(e, DccEvent::Connected { .. }), "connect").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Connected { .. }),
+        "connect",
+    )
+    .await;
     // A peer must never be able to inject an extra frame through our sender.
     session.send_line("a\r\nb").await.unwrap();
 
@@ -155,7 +175,12 @@ async fn listen_reports_its_port_then_accepts_a_chat() {
     let (session, port, mut events) = DccSession::listen(listen_options()).unwrap();
     assert!(port > 0);
 
-    let listening = wait_for(&mut events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    let listening = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
     assert!(matches!(listening, DccEvent::Listening { port: p } if p == port));
 
     let peer = tokio::spawn(async move {
@@ -166,7 +191,12 @@ async fn listen_reports_its_port_then_accepts_a_chat() {
         String::from_utf8_lossy(&buf[..n]).into_owned()
     });
 
-    wait_for(&mut events, |e| matches!(e, DccEvent::Connected { .. }), "connected").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Connected { .. }),
+        "connected",
+    )
+    .await;
     let line = wait_for(&mut events, |e| matches!(e, DccEvent::Line { .. }), "line").await;
     assert!(matches!(line, DccEvent::Line { text } if text == "from the peer"));
 
@@ -183,7 +213,12 @@ async fn listener_ignores_a_connection_from_the_wrong_address() {
         ..listen_options()
     };
     let (_session, port, mut events) = DccSession::listen(options).unwrap();
-    wait_for(&mut events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
 
     let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let _ = socket.write_all(b"intruder\n").await;
@@ -199,7 +234,10 @@ async fn listener_ignores_a_connection_from_the_wrong_address() {
     .await
     .unwrap_or(false);
 
-    assert!(!saw_connect, "session accepted a connection from an unexpected address");
+    assert!(
+        !saw_connect,
+        "session accepted a connection from an unexpected address"
+    );
 }
 
 // --- file transfer -----------------------------------------------------------
@@ -234,12 +272,20 @@ async fn receives_a_file_and_acks_every_chunk() {
     };
     let (_session, mut events) = DccSession::connect(options);
 
-    let completed = wait_for(&mut events, |e| matches!(e, DccEvent::Completed { .. }), "completed").await;
+    let completed = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Completed { .. }),
+        "completed",
+    )
+    .await;
     assert!(matches!(completed, DccEvent::Completed { path: Some(_) }));
 
     let acks = peer.await.unwrap();
     assert!(!acks.is_empty(), "receiver never acknowledged any data");
-    assert!(acks.windows(2).all(|w| w[0] <= w[1]), "acks must be monotonic");
+    assert!(
+        acks.windows(2).all(|w| w[0] <= w[1]),
+        "acks must be monotonic"
+    );
 
     let written = std::fs::read(&path).unwrap();
     assert_eq!(written, payload);
@@ -299,14 +345,22 @@ async fn fails_when_the_peer_sends_more_than_it_announced() {
 async fn sends_a_file_to_a_peer_that_connects() {
     let path = temp_path("send.bin");
     let payload = vec![9u8; 300 * 1024];
-    std::fs::File::create(&path).unwrap().write_all(&payload).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&payload)
+        .unwrap();
 
     let options = DccListenOptions {
         file_path: Some(path.clone()),
         ..listen_options()
     };
     let (_session, port, mut events) = DccSession::listen(options).unwrap();
-    wait_for(&mut events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
 
     let expected_len = payload.len();
     let peer = tokio::spawn(async move {
@@ -320,12 +374,19 @@ async fn sends_a_file_to_a_peer_that_connects() {
             }
             received.extend_from_slice(&buf[..n]);
             // Ack the running total, as a real DCC receiver does.
-            let _ = socket.write_all(&(received.len() as u32).to_be_bytes()).await;
+            let _ = socket
+                .write_all(&(received.len() as u32).to_be_bytes())
+                .await;
         }
         received
     });
 
-    wait_for(&mut events, |e| matches!(e, DccEvent::Completed { .. }), "completed").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Completed { .. }),
+        "completed",
+    )
+    .await;
     assert_eq!(peer.await.unwrap(), payload);
     let _ = std::fs::remove_file(&path);
 }
@@ -353,10 +414,20 @@ async fn reports_progress_while_transferring() {
     };
     let (_session, mut events) = DccSession::connect(options);
 
-    let progress = wait_for(&mut events, |e| matches!(e, DccEvent::Progress { .. }), "progress").await;
+    let progress = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Progress { .. }),
+        "progress",
+    )
+    .await;
     assert!(matches!(progress, DccEvent::Progress { transferred } if transferred > 0));
 
-    wait_for(&mut events, |e| matches!(e, DccEvent::Completed { .. }), "completed").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Completed { .. }),
+        "completed",
+    )
+    .await;
     let _ = std::fs::remove_file(&path);
 }
 
@@ -369,7 +440,12 @@ async fn secure_chat_completes_a_tls_handshake_and_reports_a_fingerprint() {
         ..listen_options()
     })
     .unwrap();
-    wait_for(&mut offerer_events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    wait_for(
+        &mut offerer_events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
 
     let (acceptor, mut acceptor_events) = DccSession::connect(DccConnectOptions {
         secure: true,
@@ -402,11 +478,21 @@ async fn secure_chat_completes_a_tls_handshake_and_reports_a_fingerprint() {
 
     // And the encrypted channel actually carries text both ways.
     acceptor.send_line("secure hello").await.unwrap();
-    let line = wait_for(&mut offerer_events, |e| matches!(e, DccEvent::Line { .. }), "line").await;
+    let line = wait_for(
+        &mut offerer_events,
+        |e| matches!(e, DccEvent::Line { .. }),
+        "line",
+    )
+    .await;
     assert!(matches!(line, DccEvent::Line { text } if text == "secure hello"));
 
     offerer.send_line("secure reply").await.unwrap();
-    let reply = wait_for(&mut acceptor_events, |e| matches!(e, DccEvent::Line { .. }), "reply").await;
+    let reply = wait_for(
+        &mut acceptor_events,
+        |e| matches!(e, DccEvent::Line { .. }),
+        "reply",
+    )
+    .await;
     assert!(matches!(reply, DccEvent::Line { text } if text == "secure reply"));
 }
 
@@ -414,7 +500,10 @@ async fn secure_chat_completes_a_tls_handshake_and_reports_a_fingerprint() {
 async fn secure_transfer_moves_a_file_over_tls() {
     let path = temp_path("secure-send.bin");
     let payload = vec![5u8; 128 * 1024];
-    std::fs::File::create(&path).unwrap().write_all(&payload).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&payload)
+        .unwrap();
 
     let (_offerer, port, mut offerer_events) = DccSession::listen(DccListenOptions {
         secure: true,
@@ -422,7 +511,12 @@ async fn secure_transfer_moves_a_file_over_tls() {
         ..listen_options()
     })
     .unwrap();
-    wait_for(&mut offerer_events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    wait_for(
+        &mut offerer_events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
 
     let save_path = temp_path("secure-recv.bin");
     let (_acceptor, mut acceptor_events) = DccSession::connect(DccConnectOptions {
@@ -451,7 +545,12 @@ async fn a_plain_peer_cannot_speak_to_a_secure_session() {
         ..listen_options()
     })
     .unwrap();
-    wait_for(&mut events, |e| matches!(e, DccEvent::Listening { .. }), "listening").await;
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
 
     tokio::spawn(async move {
         let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -460,7 +559,12 @@ async fn a_plain_peer_cannot_speak_to_a_secure_session() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
-    let error = wait_for(&mut events, |e| matches!(e, DccEvent::Error(_)), "tls error").await;
+    let error = wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Error(_)),
+        "tls error",
+    )
+    .await;
     assert!(matches!(error, DccEvent::Error(msg) if msg.contains("TLS")));
 }
 
