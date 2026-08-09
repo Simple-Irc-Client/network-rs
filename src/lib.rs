@@ -8,9 +8,11 @@
 
 mod client;
 mod codec;
+pub mod dcc;
 pub mod error;
 mod ratelimit;
 
 pub use client::{Encoding, IrcClient, IrcClientOptions, IrcEvent};
+pub use dcc::{DccConnectOptions, DccError, DccEvent, DccListenOptions, DccSession};
 pub use error::IrcError;
 pub use ratelimit::SlidingWindowLimiter;

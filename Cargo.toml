@@ -11,10 +11,14 @@ name = "sic_irc"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 thiserror = "2"
+# Secure DCC: peers present per-session self-signed certificates (no PKI
+# exists for DCC), so we generate one to listen with and fingerprint theirs.
+rcgen = "0.14"
+sha2 = "0.10"
 
 # Trust anchors are platform-specific. Desktop reads the OS trust store via
 # rustls-native-certs. Android has no file-based system trust store that crate
