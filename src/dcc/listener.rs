@@ -14,14 +14,12 @@ pub struct DccListener {
 }
 
 impl DccListener {
-    /// Bind inside `[start, end]`, or on any free port when both are 0.
+    /// Binds the first free port in `[start, end]`, or any free port when both are 0.
     ///
-    /// A range exists for users who forwarded specific ports on their router;
-    /// everyone else is better served by an ephemeral port.
+    /// The range is for users who forwarded specific ports on their router.
     pub fn bind(start: u16, end: u16) -> Result<Self, DccError> {
         if start == 0 && end == 0 {
-            let inner = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-            return Self::from_std(inner);
+            return Self::from_std(std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?);
         }
 
         let (low, high) = if start <= end {
@@ -29,12 +27,9 @@ impl DccListener {
         } else {
             (end, start)
         };
-        for port in low..=high {
-            if let Ok(inner) = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
-                return Self::from_std(inner);
-            }
-        }
-        Err(DccError::NoFreePort)
+        (low..=high)
+            .find_map(|port| std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).ok())
+            .map_or(Err(DccError::NoFreePort), Self::from_std)
     }
 
     fn from_std(inner: std::net::TcpListener) -> Result<Self, DccError> {
@@ -50,13 +45,10 @@ impl DccListener {
         self.port
     }
 
-    /// Accept exactly one connection, from `expect_peer` if given.
+    /// Accepts one connection, from `expect_peer` if given.
     ///
-    /// The address check matters: we advertised this port over IRC, where the
-    /// offer is visible to the server (and to anyone the peer forwards it to).
-    /// Without the check, whoever reaches the port first wins the session.
-    /// Connections from other addresses are dropped and we keep waiting, so a
-    /// prober cannot consume the slot the real peer needs.
+    /// The offer travels over IRC, so others can see the port. Connections from other addresses are
+    /// dropped and waiting continues, so a prober can neither take the session nor use up the slot.
     pub async fn accept_from(
         &self,
         expect_peer: Option<IpAddr>,
@@ -65,45 +57,21 @@ impl DccListener {
         let deadline = time::Instant::now() + timeout;
 
         loop {
-            let remaining = deadline.saturating_duration_since(time::Instant::now());
-            if remaining.is_zero() {
-                return Err(DccError::Timeout);
-            }
-
-            let (socket, peer) = time::timeout(remaining, self.inner.accept())
+            let (socket, peer) = time::timeout_at(deadline, self.inner.accept())
                 .await
                 .map_err(|_| DccError::Timeout)??;
 
             match expect_peer {
-                Some(expected) if !same_host(expected, peer) => {
-                    drop(socket);
-                    continue;
-                }
+                Some(expected) if !same_host(expected, peer) => continue,
                 _ => return Ok(socket),
             }
         }
     }
 }
 
-/// Compare the expected peer with the connecting address, treating an
-/// IPv4-mapped IPv6 address as equal to its IPv4 form — a dual-stack listener
-/// reports `::ffff:1.2.3.4` for a peer that offered `1.2.3.4`.
+/// An IPv4-mapped IPv6 address (`::ffff:1.2.3.4`) is the same host as its IPv4 form.
 fn same_host(expected: IpAddr, actual: SocketAddr) -> bool {
-    let actual = match actual.ip() {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        ip => ip,
-    };
-    let expected = match expected {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        ip => ip,
-    };
-    expected == actual
+    expected.to_canonical() == actual.ip().to_canonical()
 }
 
 #[cfg(test)]
@@ -124,7 +92,7 @@ mod tests {
         assert!(!same_host(expected, other));
     }
 
-    // `bind` hands the socket to tokio, so these need a reactor.
+    // `bind` hands the socket to tokio, so these need a reactor
 
     #[tokio::test]
     async fn bind_any_gets_a_real_port() {
@@ -136,7 +104,7 @@ mod tests {
     async fn bind_range_honours_the_range() {
         let listener = DccListener::bind(0, 0).unwrap();
         let port = listener.port();
-        // A one-port range covering the port we already hold has nothing free.
+        // A one-port range covering the port we already hold has nothing free
         assert!(matches!(
             DccListener::bind(port, port),
             Err(DccError::NoFreePort)

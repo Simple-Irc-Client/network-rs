@@ -568,6 +568,80 @@ async fn a_plain_peer_cannot_speak_to_a_secure_session() {
     assert!(matches!(error, DccEvent::Error(msg) if msg.contains("TLS")));
 }
 
+// --- closing -----------------------------------------------------------------
+
+#[tokio::test]
+async fn closing_while_waiting_for_the_peer_ends_the_session() {
+    let (session, _port, mut events) = DccSession::listen(listen_options()).unwrap();
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Listening { .. }),
+        "listening",
+    )
+    .await;
+
+    session.close().await;
+
+    let error = wait_for(&mut events, |e| matches!(e, DccEvent::Error(_)), "error").await;
+    assert!(matches!(error, DccEvent::Error(msg) if msg == DccError::Cancelled.to_string()));
+    wait_for(&mut events, |e| matches!(e, DccEvent::Closed), "close").await;
+}
+
+#[tokio::test]
+async fn closing_mid_download_removes_the_partial_file() {
+    let (port, listener) = bind_local().await;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(&[1u8; 1024]).await.unwrap();
+        // Stall with the transfer unfinished
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let path = temp_path("cancelled.bin");
+    let (session, mut events) = DccSession::connect(DccConnectOptions {
+        save_path: Some(path.clone()),
+        size: Some(4096),
+        ..connect_options(port)
+    });
+    wait_for(
+        &mut events,
+        |e| matches!(e, DccEvent::Connected { .. }),
+        "connected",
+    )
+    .await;
+
+    session.close().await;
+
+    wait_for(&mut events, |e| matches!(e, DccEvent::Closed), "close").await;
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn a_peer_vanishing_mid_download_removes_the_partial_file() {
+    let (port, listener) = bind_local().await;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(&[1u8; 1024]).await.unwrap();
+        // Wait for the first ack so the receiver has created the file, then reset instead of closing cleanly
+        let mut ack = [0u8; 4];
+        socket.read_exact(&mut ack).await.unwrap();
+        socket.set_zero_linger().unwrap();
+        drop(socket);
+    });
+
+    let path = temp_path("reset.bin");
+    let (_session, mut events) = DccSession::connect(DccConnectOptions {
+        save_path: Some(path.clone()),
+        size: Some(4096),
+        ..connect_options(port)
+    });
+
+    wait_for(&mut events, |e| matches!(e, DccEvent::Error(_)), "error").await;
+    assert!(!path.exists());
+}
+
 // --- errors ------------------------------------------------------------------
 
 #[tokio::test]

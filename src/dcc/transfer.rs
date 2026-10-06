@@ -1,14 +1,8 @@
-//! DCC SEND/GET byte pumps.
+//! DCC SEND/GET.
 //!
-//! The classic protocol: the sender streams the file; the receiver replies with
-//! a 4-byte big-endian running total after each chunk. Modern clients treat
-//! those acks as advisory, but plenty of old ones stall without them, so the
-//! receiver always sends them and the sender reads them to bound how far ahead
-//! it may run.
-//!
-//! The counter is 32-bit and wraps past 4 GiB. That is the protocol, not a bug
-//! here — so acks are used only for flow control, never as the completion
-//! signal. Completion is decided by the byte count we actually moved.
+//! The sender streams the file; the receiver answers each chunk with the running byte total as a
+//! 4-byte big-endian ack. The ack counter is 32-bit and wraps past 4 GiB, so acks only pace the
+//! sender — completion is decided by the bytes actually moved.
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,20 +17,16 @@ use super::{DccError, DccEvent};
 
 const CHUNK: usize = 64 * 1024;
 
-/// How far the sender may run ahead of the last acknowledged byte. Bounded so a
-/// receiver that stops acking cannot make us buffer the whole file in flight.
+/// How far the sender may run ahead of the last ack, so a receiver that stops acking can't make
+/// us push the whole file into the socket.
 const SEND_AHEAD_WINDOW: u64 = 1024 * 1024;
 
-/// Emit progress at most this often, so a fast local transfer doesn't flood the
-/// event channel with one message per 64 KiB.
+/// Progress is reported at most once per this many bytes.
 const PROGRESS_INTERVAL: u64 = 256 * 1024;
 
-/// How long the sender waits for the receiver's closing ack before giving up on
-/// it. The bytes are already delivered at this point, so timing out here still
-/// counts as a completed transfer.
+/// The bytes are already delivered while waiting for the final ack, so a timeout still counts as done.
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Stream `path` to the peer, reading acks to stay inside the send-ahead window.
 pub async fn send_file(
     mut stream: DccStream,
     path: &Path,
@@ -46,7 +36,7 @@ pub async fn send_file(
     let total = file.metadata().await?.len();
 
     let mut buf = vec![0u8; CHUNK];
-    let mut ack_buf = [0u8; 4];
+    let mut ack = [0u8; 4];
     let mut sent: u64 = 0;
     let mut acked: u64 = 0;
     let mut last_reported: u64 = 0;
@@ -60,16 +50,15 @@ pub async fn send_file(
         stream.io.write_all(&buf[..read]).await?;
         sent += read as u64;
 
-        if sent - last_reported >= PROGRESS_INTERVAL || sent == total {
+        if sent - last_reported >= PROGRESS_INTERVAL {
             last_reported = sent;
             let _ = events.send(DccEvent::Progress { transferred: sent }).await;
         }
 
-        // Drain acks until we are back inside the window. A peer that never
-        // acks will block here, and the session timeout upstream ends it.
+        // A peer that never acks stalls here until the caller closes the session
         while sent.saturating_sub(acked) > SEND_AHEAD_WINDOW {
-            stream.io.read_exact(&mut ack_buf).await?;
-            acked = acked.max(u32::from_be_bytes(ack_buf) as u64);
+            stream.io.read_exact(&mut ack).await?;
+            acked = acked.max(u64::from(u32::from_be_bytes(ack)));
         }
     }
 
@@ -82,26 +71,13 @@ pub async fn send_file(
         });
     }
 
-    // Wait for the receiver's final ack before closing. Two reasons: the
-    // protocol says the sender does, and dropping a socket that still has
-    // unread acks queued makes the kernel send RST, which the receiver sees as
-    // a reset connection instead of a clean end.
-    //
-    // Past 4 GiB the 32-bit counter wraps and a final ack is not identifiable,
-    // so there is nothing to wait for.
-    if total <= u64::from(u32::MAX) {
-        let target = total as u32;
+    // Closing with unread acks queued makes the kernel send RST, which the receiver sees as a reset
+    // instead of a clean end. Past 4 GiB the final ack can't be recognised, so there is nothing to wait for.
+    if let Ok(target) = u32::try_from(total) {
         let _ = time::timeout(FINAL_ACK_TIMEOUT, async {
-            while acked < total {
-                // EOF here means the peer closed without a last ack, which
-                // plenty of clients do — that is a completed transfer, not a
-                // failure.
-                if stream.io.read_exact(&mut ack_buf).await.is_err() {
-                    return;
-                }
-                let value = u32::from_be_bytes(ack_buf);
-                acked = acked.max(u64::from(value));
-                if value == target {
+            // EOF before the last ack is common and still a completed transfer
+            while stream.io.read_exact(&mut ack).await.is_ok() {
+                if u32::from_be_bytes(ack) == target {
                     return;
                 }
             }
@@ -110,16 +86,13 @@ pub async fn send_file(
     }
 
     let _ = stream.io.shutdown().await;
-
     let _ = events.send(DccEvent::Progress { transferred: sent }).await;
     Ok(())
 }
 
-/// Receive `expected` bytes into `path`, acking as we go.
+/// Saves the peer's file to `path`. With an announced size, a short or over-long transfer fails.
 ///
-/// A transfer that ends early, or one that tries to write more than announced,
-/// fails loudly. Silently keeping a truncated file is worse than no file: the
-/// user would find a plausible-looking download that is quietly corrupt.
+/// The caller removes the file when this fails.
 pub async fn receive_file(
     mut stream: DccStream,
     path: &Path,
@@ -136,27 +109,23 @@ pub async fn receive_file(
         if read == 0 {
             break;
         }
-
         received += read as u64;
 
-        if let Some(total) = expected {
-            if received > total {
-                // Refuse to keep writing past the announced size — that is how
-                // a "small" offer turns into a disk-filling one.
-                let _ = file.flush().await;
-                let _ = tokio::fs::remove_file(path).await;
-                return Err(DccError::SizeMismatch {
-                    expected: total,
-                    actual: received,
-                });
-            }
+        // Stops a "small" offer from filling the disk
+        if let Some(total) = expected.filter(|&total| received > total) {
+            return Err(DccError::SizeMismatch {
+                expected: total,
+                actual: received,
+            });
         }
 
         file.write_all(&buf[..read]).await?;
 
-        // Wrapping is intended: the ack field is 32-bit by definition.
-        let ack = (received as u32).to_be_bytes();
-        stream.io.write_all(&ack).await?;
+        // Truncation is the protocol: the ack field is 32-bit
+        stream
+            .io
+            .write_all(&(received as u32).to_be_bytes())
+            .await?;
         stream.io.flush().await?;
 
         if received - last_reported >= PROGRESS_INTERVAL {
@@ -168,10 +137,8 @@ pub async fn receive_file(
                 .await;
         }
 
-        // Stop at the announced size rather than waiting for EOF. A DCC sender
-        // typically holds the socket open until it sees the final ack, so
-        // reading until EOF would deadlock: it waits for our ack, we wait for
-        // its close.
+        // The sender usually keeps the socket open until it sees the final ack, so waiting for EOF
+        // here would deadlock
         if expected == Some(received) {
             break;
         }
@@ -180,14 +147,11 @@ pub async fn receive_file(
     file.flush().await?;
     file.sync_all().await?;
 
-    if let Some(total) = expected {
-        if received != total {
-            let _ = tokio::fs::remove_file(path).await;
-            return Err(DccError::SizeMismatch {
-                expected: total,
-                actual: received,
-            });
-        }
+    if let Some(total) = expected.filter(|&total| received != total) {
+        return Err(DccError::SizeMismatch {
+            expected: total,
+            actual: received,
+        });
     }
 
     let _ = events

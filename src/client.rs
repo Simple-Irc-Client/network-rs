@@ -1,44 +1,29 @@
-//! Async IRC byte-pipe transport.
+//! IRC connection as a byte pipe.
 //!
-//! The driver runs as a single tokio task that owns the socket and a `select!`
-//! loop over:
-//!   - socket reads (line buffered) -> emitted as inbound `Raw` events
-//!   - inbound commands from the caller (send / quit / disconnect)
-//!
-//! This is a **pure transport**: it does NOT speak any IRC protocol — no
-//! registration, no CAP negotiation, not even PING/PONG. The caller (the app's
-//! kernel) owns the entire IRC conversation, including replying to server PINGs
-//! and connection-liveness/keepalive policy. The driver only establishes the
-//! TCP/TLS socket, surfaces every received line, writes the lines the caller
-//! sends (rate-limited), and reports closure/errors.
-//!
-//! Events flow out over an `mpsc::Receiver<IrcEvent>` so the consumer can
-//! forward them however it likes.
+//! One tokio task owns the socket: it surfaces every received line as an [`IrcEvent::Raw`] and writes
+//! the lines the caller sends. It speaks no IRC itself — registration, CAP, PING replies and
+//! liveness all belong to the caller.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
-
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-use crate::codec::{strip_crlf, LineBuffer, MAX_RECEIVE_BUFFER};
+use crate::codec::{strip_crlf, Encoding, LineBuffer, MAX_RECEIVE_BUFFER};
 use crate::error::IrcError;
-use crate::ratelimit::SlidingWindowLimiter;
+use crate::ratelimit::RateLimiter;
 
+/// Covers the TCP connect and the TLS handshake together.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum Encoding {
-    #[default]
-    Utf8,
-    Latin1,
-}
+const SEND_LIMIT_MESSAGES: u32 = 50;
+const SEND_LIMIT_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct IrcClientOptions {
@@ -61,20 +46,15 @@ impl IrcClientOptions {
 
 #[derive(Clone, Debug)]
 pub enum IrcEvent {
-    /// TCP/TLS handshake completed.
     SocketConnected,
-    /// A raw IRC line received from the server. (Outbound lines the caller
-    /// sends are not echoed — the caller already has them.)
-    Raw { line: String },
-    /// Connection closed.
+    /// A line received from the server. Lines the caller sends are not echoed.
+    Raw {
+        line: String,
+    },
+    /// The connection ended. Always the last event.
     Closed,
-    /// A non-fatal or fatal error. A fatal error is followed by `Closed`.
+    /// Reported just before `Closed`.
     Error(String),
-}
-
-#[derive(Clone)]
-pub struct IrcClient {
-    cmd_tx: mpsc::Sender<ClientCommand>,
 }
 
 #[derive(Debug)]
@@ -84,211 +64,161 @@ enum ClientCommand {
     Disconnect,
 }
 
+/// Handle to a connection. Dropping every clone closes it.
+#[derive(Clone)]
+pub struct IrcClient {
+    commands: mpsc::Sender<ClientCommand>,
+}
+
 impl IrcClient {
-    /// Connect to an IRC server. Returns immediately with a handle and an
-    /// event receiver; the actual connection happens on a spawned task and
-    /// progress is reported as `IrcEvent`s.
+    /// Starts connecting in the background; progress arrives on the returned receiver.
     pub fn connect(options: IrcClientOptions) -> (Self, mpsc::Receiver<IrcEvent>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (command_tx, command_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(256);
-        tokio::spawn(run(options, cmd_rx, event_tx));
-        (Self { cmd_tx }, event_rx)
+        tokio::spawn(run(options, command_rx, event_tx));
+        (
+            Self {
+                commands: command_tx,
+            },
+            event_rx,
+        )
     }
 
-    /// Send a raw IRC line. CR/LF is stripped to prevent line injection.
+    /// Lines over the rate limit (50 per 5 s) are dropped.
     pub async fn send(&self, line: impl Into<String>) -> Result<(), IrcError> {
-        self.cmd_tx
-            .send(ClientCommand::Send(line.into()))
-            .await
-            .map_err(|_| {
-                IrcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "client task gone",
-                ))
-            })
+        self.command(ClientCommand::Send(line.into())).await
     }
 
-    /// Send `QUIT [:message]` and close the connection.
+    /// Sends `QUIT [:message]`, then closes the connection.
     pub async fn quit(&self, message: Option<String>) -> Result<(), IrcError> {
-        self.cmd_tx
-            .send(ClientCommand::Quit(message))
-            .await
-            .map_err(|_| {
-                IrcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "client task gone",
-                ))
-            })
+        self.command(ClientCommand::Quit(message)).await
     }
 
-    /// Forcefully drop the connection without sending QUIT.
+    /// Closes the connection without sending QUIT.
     pub async fn disconnect(&self) -> Result<(), IrcError> {
-        self.cmd_tx
-            .send(ClientCommand::Disconnect)
+        self.command(ClientCommand::Disconnect).await
+    }
+
+    async fn command(&self, command: ClientCommand) -> Result<(), IrcError> {
+        self.commands
+            .send(command)
             .await
-            .map_err(|_| {
-                IrcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "client task gone",
-                ))
-            })
+            .map_err(|_| IrcError::Closed)
     }
 }
 
-// --- internals ---------------------------------------------------------------
-
-/// Single trait alias so we can box the socket regardless of TLS.
 trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> IoStream for T {}
 
 async fn run(
-    opts: IrcClientOptions,
-    mut cmd_rx: mpsc::Receiver<ClientCommand>,
-    event_tx: mpsc::Sender<IrcEvent>,
+    options: IrcClientOptions,
+    mut commands: mpsc::Receiver<ClientCommand>,
+    events: mpsc::Sender<IrcEvent>,
 ) {
-    let mut stream: Box<dyn IoStream> = match connect_socket(&opts).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = event_tx.send(IrcEvent::Error(e.to_string())).await;
-            let _ = event_tx.send(IrcEvent::Closed).await;
-            return;
+    let result = match time::timeout(CONNECT_TIMEOUT, connect_socket(&options)).await {
+        Ok(Ok(stream)) => {
+            let _ = events.send(IrcEvent::SocketConnected).await;
+            pump(stream, options.encoding, &mut commands, &events).await
         }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(IrcError::ConnectTimeout),
     };
 
-    let _ = event_tx.send(IrcEvent::SocketConnected).await;
+    if let Err(error) = result {
+        let _ = events.send(IrcEvent::Error(error.to_string())).await;
+    }
+    let _ = events.send(IrcEvent::Closed).await;
+}
 
-    let mut buf = vec![0u8; 8192];
-    let mut line_buffer = LineBuffer::new();
-    // Caller-originated sends only. Matches the `./network` bridge, which
-    // rate-limits inbound WS messages.
-    let mut send_limiter = SlidingWindowLimiter::default_irc();
+/// Moves lines both ways until either side closes the connection.
+async fn pump(
+    mut stream: Box<dyn IoStream>,
+    encoding: Encoding,
+    commands: &mut mpsc::Receiver<ClientCommand>,
+    events: &mpsc::Sender<IrcEvent>,
+) -> Result<(), IrcError> {
+    let mut read_buf = vec![0u8; 8192];
+    let mut lines = LineBuffer::default();
+    let mut send_limiter = RateLimiter::new(SEND_LIMIT_MESSAGES, SEND_LIMIT_WINDOW);
 
     loop {
         tokio::select! {
-            // Socket read -> surface each line as an inbound Raw event.
-            res = stream.read(&mut buf) => {
-                match res {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        line_buffer.extend(&buf[..n]);
-                        if line_buffer.len() > MAX_RECEIVE_BUFFER {
-                            let _ = event_tx
-                                .send(IrcEvent::Error(IrcError::BufferOverflow.to_string()))
-                                .await;
-                            break;
-                        }
-                        while let Some(line) = line_buffer.next_line(opts.encoding) {
-                            let _ = event_tx.send(IrcEvent::Raw { line }).await;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(IrcEvent::Error(e.to_string())).await;
-                        break;
-                    }
+            read = stream.read(&mut read_buf) => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(());
+                }
+                lines.extend(&read_buf[..n]);
+                while let Some(line) = lines.next_line(encoding) {
+                    let _ = events.send(IrcEvent::Raw { line }).await;
+                }
+                if lines.len() > MAX_RECEIVE_BUFFER {
+                    return Err(IrcError::BufferOverflow);
                 }
             }
 
-            // Outbound commands.
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(ClientCommand::Send(line)) => {
-                        // Over the sliding window (50 msgs / 5 s): drop
-                        // silently, matching the `./network` bridge. Queuing
-                        // would risk unbounded memory under a flood.
-                        if !send_limiter.check_and_consume() {
-                            continue;
-                        }
-                        if write_line(&mut stream, &line).await.is_err() {
-                            break;
-                        }
+            command = commands.recv() => match command {
+                // Dropped rather than queued, so a flood can't grow memory
+                Some(ClientCommand::Send(line)) => {
+                    if send_limiter.try_acquire() {
+                        write_line(&mut stream, &line).await?;
                     }
-                    Some(ClientCommand::Quit(msg)) => {
-                        let q = match msg {
-                            Some(m) => format!("QUIT :{}", strip_crlf(&m)),
-                            None => "QUIT".to_string(),
-                        };
-                        let _ = write_line(&mut stream, &q).await;
-                        let _ = stream.shutdown().await;
-                        break;
-                    }
-                    Some(ClientCommand::Disconnect) | None => break,
                 }
-            }
+                Some(ClientCommand::Quit(message)) => {
+                    let quit = message.map_or_else(|| "QUIT".to_owned(), |text| format!("QUIT :{text}"));
+                    // The connection ends either way, so a failed goodbye is not an error
+                    let _ = write_line(&mut stream, &quit).await;
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+                Some(ClientCommand::Disconnect) | None => return Ok(()),
+            },
         }
     }
-
-    close(&event_tx).await;
 }
 
-async fn close(event_tx: &mpsc::Sender<IrcEvent>) {
-    let _ = event_tx.send(IrcEvent::Closed).await;
-}
-
-/// Write one IRC line (CRLF-terminated, injection-stripped) to the socket.
-/// Outbound lines are not echoed back as events — the caller already has them.
-async fn write_line<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    line: &str,
-) -> Result<(), std::io::Error> {
-    let stripped = strip_crlf(line);
-    let mut bytes = stripped.into_bytes();
+async fn write_line(stream: &mut (impl AsyncWrite + Unpin), line: &str) -> std::io::Result<()> {
+    let mut bytes = strip_crlf(line).into_bytes();
     bytes.extend_from_slice(b"\r\n");
     stream.write_all(&bytes).await?;
     stream.flush().await
 }
 
-/// Build the TLS trust anchors for the current platform.
-///
-/// Desktop/server targets read the OS trust store (`rustls-native-certs`).
-/// Android has no file-based store that crate can read, so we bundle Mozilla's
-/// WebPKI roots — adequate for the publicly-trusted certificates IRC networks
-/// present. (A future enhancement could bridge to the Android Java KeyStore via
-/// `rustls-platform-verifier` to honor user/enterprise-added CAs.)
-fn load_root_store() -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            let _ = roots.add(cert);
-        }
-    }
-
-    #[cfg(target_os = "android")]
-    {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    roots
-}
-
-async fn connect_socket(opts: &IrcClientOptions) -> Result<Box<dyn IoStream>, IrcError> {
-    let addr = format!("{}:{}", opts.host, opts.port);
-    let tcp = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| IrcError::ConnectTimeout)??;
-    if !opts.tls {
+async fn connect_socket(options: &IrcClientOptions) -> Result<Box<dyn IoStream>, IrcError> {
+    let tcp = TcpStream::connect((options.host.as_str(), options.port)).await?;
+    if !options.tls {
         return Ok(Box::new(tcp));
     }
-
-    let roots = load_root_store();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| IrcError::Tls(e.to_string()))?
-        .with_root_certificates(roots)
+        .with_root_certificates(load_root_store())
         .with_no_client_auth();
 
-    let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(opts.host.clone())
-        .map_err(|e| IrcError::InvalidHostname(format!("{}: {}", opts.host, e)))?;
+    let server_name = ServerName::try_from(options.host.clone())
+        .map_err(|e| IrcError::InvalidHostname(format!("{}: {e}", options.host)))?;
 
-    let tls = time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
+    let tls = TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
         .await
-        .map_err(|_| IrcError::ConnectTimeout)?
         .map_err(|e| IrcError::Tls(e.to_string()))?;
 
     Ok(Box::new(tls))
+}
+
+fn load_root_store() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+
+    #[cfg(not(target_os = "android"))]
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+
+    // Android keeps its trust store in the Java KeyStore, which rustls-native-certs can't read
+    #[cfg(target_os = "android")]
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    roots
 }

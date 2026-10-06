@@ -1,43 +1,34 @@
-//! DCC (Direct Client-to-Client) transport.
+//! DCC (Direct Client-to-Client) as a byte pipe.
 //!
-//! Like the IRC client in this crate, this is a byte pipe: it opens or accepts
-//! the peer socket, optionally wraps it in TLS for the secure variants, and
-//! then either pumps newline-framed chat or moves a file. It knows nothing
-//! about CTCP — the caller parses the offer and decides whether to act on it.
+//! Opens or accepts the peer socket, optionally wraps it in TLS, then either carries newline-framed
+//! chat or moves a file. CTCP offers are parsed by the caller.
 //!
-//! Two roles:
-//!   - **offerer** — [`DccSession::listen`] binds a port so the caller can put
-//!     it in a `DCC CHAT`/`DCC SEND` CTCP, then waits for the peer to connect.
-//!   - **acceptor** — [`DccSession::connect`] dials the address from an offer.
-//!
-//! Security properties that live here rather than in the caller: the listener
-//! only accepts a connection from the address the offer went to, both roles
-//! give up if the peer never shows, and a transfer whose byte count disagrees
-//! with the announced size fails instead of leaving a plausible-looking but
-//! corrupt file on disk.
+//! - offerer: [`DccSession::listen`] binds a port for the caller's `DCC CHAT`/`DCC SEND` offer.
+//! - acceptor: [`DccSession::connect`] dials the address from a peer's offer.
 
 mod chat;
 mod listener;
 mod stream;
 mod transfer;
 
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 
-use crate::client::Encoding;
+use crate::codec::Encoding;
+use listener::DccListener;
 
-pub use listener::DccListener;
+/// How long a port we advertised waits for the peer.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long to wait for the peer to connect to a port we advertised.
-pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// How long to wait when dialling a peer's advertised address.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long dialling a peer's advertised address may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DccError {
@@ -47,8 +38,8 @@ pub enum DccError {
     #[error("timed out waiting for the peer")]
     Timeout,
 
-    #[error("connection from unexpected address {0}")]
-    UnexpectedPeer(IpAddr),
+    #[error("session closed before it finished")]
+    Cancelled,
 
     #[error("transfer size mismatch: expected {expected} bytes, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
@@ -65,12 +56,11 @@ pub enum DccError {
 
 #[derive(Clone, Debug)]
 pub enum DccEvent {
-    /// A port was bound and is in the CTCP offer the caller is about to send.
+    /// The port is bound and can go into the offer.
     Listening {
         port: u16,
     },
-    /// The peer socket is up. `tls_fingerprint` is present only on the dialling
-    /// side of a secure session (see `stream.rs`).
+    /// `tls_fingerprint` is known only on the dialling side of a secure session (see `stream.rs`).
     Connected {
         tls_fingerprint: Option<String>,
     },
@@ -78,34 +68,28 @@ pub enum DccEvent {
     Line {
         text: String,
     },
-    /// Bytes moved so far, for a file transfer.
     Progress {
         transferred: u64,
     },
-    /// The transfer finished and, when receiving, the file is on disk at `path`.
+    /// The session finished; `path` is the received file, if any.
     Completed {
         path: Option<String>,
     },
+    /// Reported just before `Closed`.
+    Error(String),
     /// The session ended. Always the last event.
     Closed,
-    Error(String),
-}
-
-#[derive(Debug)]
-pub enum DccCommand {
-    SendLine(String),
-    Close,
 }
 
 #[derive(Clone, Debug)]
 pub struct DccListenOptions {
     pub secure: bool,
-    /// Inclusive port range to bind inside. `0..=0` means "any free port".
+    /// Inclusive port range to bind in; `0..=0` means any free port.
     pub port_start: u16,
     pub port_end: u16,
     /// Only accept a connection from this address.
     pub expect_peer: Option<IpAddr>,
-    /// `Some` for DCC SEND (we transmit this file), `None` for DCC CHAT.
+    /// The file to send for DCC SEND; `None` for DCC CHAT.
     pub file_path: Option<PathBuf>,
     pub encoding: Encoding,
 }
@@ -115,154 +99,186 @@ pub struct DccConnectOptions {
     pub host: String,
     pub port: u16,
     pub secure: bool,
-    /// `Some` when receiving a file, `None` for DCC CHAT.
+    /// Where to save the offered file; `None` for DCC CHAT.
     pub save_path: Option<PathBuf>,
-    /// Announced size, used to detect a short or over-long transfer.
+    /// The announced size, used to reject a short or over-long transfer.
     pub size: Option<u64>,
     pub encoding: Encoding,
 }
 
-/// Handle to a running DCC session.
+#[derive(Debug)]
+enum ChatCommand {
+    SendLine(String),
+    Close,
+}
+
+/// Handle to a running DCC session. Dropping every clone closes it.
 #[derive(Clone)]
 pub struct DccSession {
-    cmd_tx: mpsc::Sender<DccCommand>,
+    // Chat lines and the close that follows them must stay in order, so chat has its own queue
+    chat: mpsc::Sender<ChatCommand>,
+    // Interrupts the stages that read no commands: waiting for the peer, the TLS handshake, a transfer
+    closed: Arc<watch::Sender<bool>>,
+}
+
+/// Receiving ends of a [`DccSession`], owned by its task.
+struct SessionControl {
+    chat: mpsc::Receiver<ChatCommand>,
+    closed: watch::Receiver<bool>,
+}
+
+impl SessionControl {
+    /// Runs `stage` unless the session is closed first.
+    async fn unless_closed<T>(
+        &mut self,
+        stage: impl Future<Output = Result<T, DccError>>,
+    ) -> Result<T, DccError> {
+        tokio::select! {
+            result = stage => result,
+            // Also resolves when every handle is dropped
+            _ = self.closed.wait_for(|&closed| closed) => Err(DccError::Cancelled),
+        }
+    }
 }
 
 impl DccSession {
-    /// Bind a port, then wait for the peer on a background task.
+    fn new() -> (Self, SessionControl) {
+        let (chat_tx, chat_rx) = mpsc::channel(64);
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let session = Self {
+            chat: chat_tx,
+            closed: Arc::new(closed_tx),
+        };
+        let control = SessionControl {
+            chat: chat_rx,
+            closed: closed_rx,
+        };
+        (session, control)
+    }
+
+    /// Binds a port, then waits for the peer in the background.
     ///
-    /// Returns as soon as the socket is bound, so the caller can put the real
-    /// port into the CTCP offer before anyone could connect to it.
+    /// Returns once the port is bound, so the caller can put it into the offer before anyone connects.
     pub fn listen(
         options: DccListenOptions,
     ) -> Result<(Self, u16, mpsc::Receiver<DccEvent>), DccError> {
         let listener = DccListener::bind(options.port_start, options.port_end)?;
         let port = listener.port();
-
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (session, control) = Self::new();
         let (event_tx, event_rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
             let _ = event_tx.send(DccEvent::Listening { port }).await;
-            let result = run_listen(listener, options, cmd_rx, &event_tx).await;
+            let result = run_listen(listener, options, control, &event_tx).await;
             finish(result, &event_tx).await;
         });
 
-        Ok((Self { cmd_tx }, port, event_rx))
+        Ok((session, port, event_rx))
     }
 
-    /// Dial the address from a peer's offer.
+    /// Dials the address from a peer's offer in the background.
     pub fn connect(options: DccConnectOptions) -> (Self, mpsc::Receiver<DccEvent>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (session, control) = Self::new();
         let (event_tx, event_rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
-            let result = run_connect(options, cmd_rx, &event_tx).await;
+            let result = run_connect(options, control, &event_tx).await;
             finish(result, &event_tx).await;
         });
 
-        (Self { cmd_tx }, event_rx)
+        (session, event_rx)
     }
 
     pub async fn send_line(&self, text: impl Into<String>) -> Result<(), DccError> {
-        self.cmd_tx
-            .send(DccCommand::SendLine(text.into()))
+        self.chat
+            .send(ChatCommand::SendLine(text.into()))
             .await
-            .map_err(|_| {
-                DccError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "dcc session gone",
-                ))
-            })
+            .map_err(|_| DccError::Cancelled)
     }
 
-    pub async fn close(&self) -> Result<(), DccError> {
-        // A session that already ended is not an error to close.
-        let _ = self.cmd_tx.send(DccCommand::Close).await;
-        Ok(())
+    /// Ends the session; chat lines already sent are delivered first. Closing an ended session is a no-op.
+    pub async fn close(&self) {
+        let _ = self.chat.send(ChatCommand::Close).await;
+        self.closed.send_replace(true);
     }
 }
 
-async fn finish(result: Result<Option<String>, DccError>, events: &mpsc::Sender<DccEvent>) {
-    match result {
-        Ok(path) => {
-            let _ = events.send(DccEvent::Completed { path }).await;
-        }
-        Err(e) => {
-            let _ = events.send(DccEvent::Error(e.to_string())).await;
-        }
-    }
+async fn finish(result: Result<Option<PathBuf>, DccError>, events: &mpsc::Sender<DccEvent>) {
+    let event = match result {
+        Ok(path) => DccEvent::Completed {
+            path: path.map(|p| p.to_string_lossy().into_owned()),
+        },
+        Err(error) => DccEvent::Error(error.to_string()),
+    };
+    let _ = events.send(event).await;
     let _ = events.send(DccEvent::Closed).await;
-}
-
-/// Wrap an accepted/dialled socket in TLS when the session is a secure variant.
-async fn wrap(tcp: TcpStream, secure: bool, incoming: bool) -> Result<stream::DccStream, DccError> {
-    if !secure {
-        return Ok(stream::plain(tcp));
-    }
-    if incoming {
-        stream::accept_tls(tcp).await
-    } else {
-        stream::connect_tls(tcp).await
-    }
 }
 
 async fn run_listen(
     listener: DccListener,
     options: DccListenOptions,
-    commands: mpsc::Receiver<DccCommand>,
+    mut control: SessionControl,
     events: &mpsc::Sender<DccEvent>,
-) -> Result<Option<String>, DccError> {
-    let tcp = listener
-        .accept_from(options.expect_peer, ACCEPT_TIMEOUT)
+) -> Result<Option<PathBuf>, DccError> {
+    let tcp = control
+        .unless_closed(listener.accept_from(options.expect_peer, ACCEPT_TIMEOUT))
         .await?;
-
-    let stream = wrap(tcp, options.secure, true).await?;
-    let _ = events
-        .send(DccEvent::Connected {
-            tls_fingerprint: stream.fingerprint.clone(),
-        })
-        .await;
+    let stream = if options.secure {
+        control.unless_closed(stream::accept_tls(tcp)).await?
+    } else {
+        stream::plain(tcp)
+    };
+    report_connected(stream.fingerprint.clone(), events).await;
 
     match options.file_path {
-        // Offering a file: we are the sender.
         Some(path) => {
-            transfer::send_file(stream, &path, events).await?;
-            Ok(None)
+            control
+                .unless_closed(transfer::send_file(stream, &path, events))
+                .await?
         }
-        None => {
-            chat::run_chat(stream, commands, events, options.encoding).await?;
-            Ok(None)
-        }
+        None => chat::run_chat(stream, &mut control.chat, events, options.encoding).await?,
     }
+    Ok(None)
 }
 
 async fn run_connect(
     options: DccConnectOptions,
-    commands: mpsc::Receiver<DccCommand>,
+    mut control: SessionControl,
     events: &mpsc::Sender<DccEvent>,
-) -> Result<Option<String>, DccError> {
-    let addr = format!("{}:{}", options.host, options.port);
-    let tcp = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+) -> Result<Option<PathBuf>, DccError> {
+    let dial = async {
+        time::timeout(
+            CONNECT_TIMEOUT,
+            TcpStream::connect((options.host.as_str(), options.port)),
+        )
         .await
-        .map_err(|_| DccError::Timeout)??;
+        .map_err(|_| DccError::Timeout)?
+        .map_err(DccError::Io)
+    };
+    let tcp = control.unless_closed(dial).await?;
+    let stream = if options.secure {
+        control.unless_closed(stream::connect_tls(tcp)).await?
+    } else {
+        stream::plain(tcp)
+    };
+    report_connected(stream.fingerprint.clone(), events).await;
 
-    let stream = wrap(tcp, options.secure, false).await?;
-    let _ = events
-        .send(DccEvent::Connected {
-            tls_fingerprint: stream.fingerprint.clone(),
-        })
+    let Some(path) = options.save_path else {
+        chat::run_chat(stream, &mut control.chat, events, options.encoding).await?;
+        return Ok(None);
+    };
+
+    let received = control
+        .unless_closed(transfer::receive_file(stream, &path, options.size, events))
         .await;
-
-    match options.save_path {
-        // Accepting a file: we are the receiver.
-        Some(path) => {
-            transfer::receive_file(stream, &path, options.size, events).await?;
-            Ok(Some(path.to_string_lossy().into_owned()))
-        }
-        None => {
-            chat::run_chat(stream, commands, events, options.encoding).await?;
-            Ok(None)
-        }
+    if received.is_err() {
+        // A partial download would look complete on disk
+        let _ = tokio::fs::remove_file(&path).await;
     }
+    received?;
+    Ok(Some(path))
+}
+
+async fn report_connected(tls_fingerprint: Option<String>, events: &mpsc::Sender<DccEvent>) {
+    let _ = events.send(DccEvent::Connected { tls_fingerprint }).await;
 }
