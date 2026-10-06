@@ -5,6 +5,9 @@ pub enum IrcError {
     #[error("connection timed out")]
     ConnectTimeout,
 
+    #[error("connection closed")]
+    Closed,
+
     #[error("receive buffer overflow: server sent too much data without line terminators")]
     BufferOverflow,
 

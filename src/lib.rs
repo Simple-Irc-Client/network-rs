@@ -1,16 +1,16 @@
-//! IRC byte-pipe transport for Simple Irc Client.
+//! Network transport for Simple Irc Client.
 //!
-//! Async [`IrcClient`] that establishes a TCP or TLS connection to an IRC
-//! server and surfaces every received line over an [`IrcEvent`] channel, while
-//! writing the lines the caller sends. It is a pure transport: it speaks no IRC
-//! protocol itself (no registration, CAP, or PING/PONG) — the caller owns the
-//! entire IRC conversation.
+//! [`IrcClient`] is a byte pipe to an IRC server: it connects over TCP or TLS, surfaces every received
+//! line and writes the lines it is given. The app's kernel owns the IRC conversation itself.
+//! [`dcc`] does the same for DCC CHAT and DCC SEND peers.
 
 mod client;
 mod codec;
+pub mod dcc;
 pub mod error;
 mod ratelimit;
 
-pub use client::{Encoding, IrcClient, IrcClientOptions, IrcEvent};
+pub use client::{IrcClient, IrcClientOptions, IrcEvent};
+pub use codec::Encoding;
+pub use dcc::{DccConnectOptions, DccError, DccEvent, DccListenOptions, DccSession};
 pub use error::IrcError;
-pub use ratelimit::SlidingWindowLimiter;
