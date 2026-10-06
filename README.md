@@ -9,7 +9,7 @@ A Rust **byte-pipe transport** for IRC servers. Embedded directly into the Tauri
 - Async TCP and TLS connections to IRC servers
 - Pure transport: **does NOT speak IRC protocol** — no registration, CAP, or PING/PONG
 - Receive-buffer cap to defend against unterminated server lines
-- Sliding-window rate limiter for outbound messages
+- Fixed-window rate limiter for outbound messages
 - CR/LF stripping on outbound lines to prevent IRC line injection
 
 ## Requirements
